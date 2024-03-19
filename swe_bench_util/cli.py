@@ -1,5 +1,6 @@
 """This module provides the CLI."""
-
+import os
+import subprocess
 from typing import Optional
 import json
 import sys
@@ -12,13 +13,31 @@ from datasets import load_dataset
 
 app = typer.Typer()
 get_app = typer.Typer()
+run_app = typer.Typer()
 app.add_typer(get_app, name="get")
+app.add_typer(run_app, name="run")
 
 def _version_callback(value: bool) -> None:
     if value:
         typer.echo(f"{__app_name__} v{__version__}")
         raise typer.Exit()
 
+def maybe_clone(repo_url, repo_dir):
+    if not os.path.exists(f"{repo_dir}/.git"):
+        # Clone the repo if the directory doesn't exist
+        result = subprocess.run(['git', 'clone', repo_url, repo_dir], check=True, text=True, capture_output=True)
+
+        if result.returncode == 0:
+            print(f"Repo '{repo_url}' was cloned to '{repo_dir}'", file=sys.stderr)
+        else:
+            print(f"Failed to clone repo '{repo_url}' to '{repo_dir}'", file=sys.stderr)
+            raise typer.Exit(code=1)
+    else:
+        print(f"Repo '{repo_url}' already exists in '{repo_dir}'", file=sys.stderr)
+
+def checkout_commit(repo_dir, commit_hash):
+    #TODO?         f"git reset --hard {base_commit}",
+    subprocess.run(['git', 'checkout', commit_hash], cwd=repo_dir, check=True)
 
 def write_file(path, text):
     with open(path, 'w') as f:
@@ -88,6 +107,22 @@ def oracle(split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
             "test_patch_files": test_patch_files 
         })
     write_json('rows', "oracle", result)
+
+
+@run_app.command()
+def retrieve(index:int=0, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
+    dataset = load_dataset(dataset_name, split=split)
+    row_data = dataset[index]
+    repo_name = row_data['repo'].split('/')[-1]
+    repo = f'git@github.com:{row_data["repo"]}.git'
+    base_commit = row_data['base_commit']
+    path = f'/tmp/{dataset_name}-{split}/{repo_name}/{base_commit}'
+    if not os.path.exists(path):
+        os.makedirs(path)
+        print(f"Directory '{path}' was created.")
+    maybe_clone(repo, path)
+    checkout_commit(path, base_commit)
+    pass
 
 @app.callback()
 def main(

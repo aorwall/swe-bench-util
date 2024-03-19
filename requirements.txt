@@ -6,3 +6,10 @@ pytest==8.1.1
 typer==0.9.0
 # typing_extensions==4.10.0
 datasets==2.18.0
+
+llama-index==0.10.20
+llama-index-vector-stores-faiss==0.1.2
+faiss-cpu==1.8.0
+
+llama-index-embeddings-openai==0.1.6
+llama-index-readers-file
