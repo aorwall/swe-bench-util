@@ -1,21 +1,70 @@
 """This module provides the CLI."""
+import json
 import os
 import subprocess
-from typing import Optional
-import json
 import sys
+from typing import Optional, List
 
 import typer
+from datasets import load_dataset
+from llama_index.core.node_parser import TokenTextSplitter, CodeSplitter
+from llama_index.embeddings.openai import OpenAIEmbedding
 
 from swe_bench_util import __app_name__, __version__
-
-from datasets import load_dataset
+from swe_bench_util.llama_index_retriever import IngestionPipelineSetup, LlamaIndexCodeSnippetRetriever
+from swe_bench_util.retriever import CodeSnippetRetriever
+from swe_bench_util.splitters.code_splitter import CodeSplitterV2
 
 app = typer.Typer()
 get_app = typer.Typer()
 run_app = typer.Typer()
 app.add_typer(get_app, name="get")
 app.add_typer(run_app, name="run")
+
+devin_scikit_learn_pass = [
+    "scikit-learn__scikit-learn-10297",
+    "scikit-learn__scikit-learn-10870",
+    "scikit-learn__scikit-learn-10986",
+    "scikit-learn__scikit-learn-11578",
+    "scikit-learn__scikit-learn-12973",
+    "scikit-learn__scikit-learn-13496",
+    "scikit-learn__scikit-learn-14496",
+    "scikit-learn__scikit-learn-15100",
+    "scikit-learn__scikit-learn-15119",
+    "scikit-learn__scikit-learn-15512",
+    "scikit-learn__scikit-learn-19664"
+]
+
+ingestion_pipelines = [
+    IngestionPipelineSetup(
+        name="text-embedding-3-small--text-splitter-512",
+        transformations=[
+            TokenTextSplitter(chunk_size=512)
+        ],
+        embed_model=OpenAIEmbedding(model="text-embedding-3-small"),
+        dimensions=1536
+    ),
+    IngestionPipelineSetup(
+        name="text-embedding-3-small--code-splitter-1500",
+        transformations=[
+            CodeSplitter(max_chars=1500, language="python")
+        ],
+        embed_model=OpenAIEmbedding(model="text-embedding-3-small"),
+        dimensions=1536
+    ),
+    IngestionPipelineSetup(
+        name="text-embedding-3-small--code-splitter-v2-256",
+        transformations=[
+            CodeSplitterV2(max_tokens=256, language="python")
+        ],
+        embed_model=OpenAIEmbedding(model="text-embedding-3-small"),
+        dimensions=1536
+    )
+
+]
+
+
+
 
 def _version_callback(value: bool) -> None:
     if value:
@@ -36,8 +85,7 @@ def maybe_clone(repo_url, repo_dir):
         print(f"Repo '{repo_url}' already exists in '{repo_dir}'", file=sys.stderr)
 
 def checkout_commit(repo_dir, commit_hash):
-    #TODO?         f"git reset --hard {base_commit}",
-    subprocess.run(['git', 'checkout', commit_hash], cwd=repo_dir, check=True)
+    subprocess.run(['git', 'reset', '--hard', commit_hash], cwd=repo_dir, check=True)
 
 def write_file(path, text):
     with open(path, 'w') as f:
@@ -75,14 +123,29 @@ def write_markdown(path, name, data):
     write_file(md_path, text)
 
 @get_app.command()
-def row(index:int=0, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
+def row(index:int=0, id:str=None, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
     """Download one row"""
-    dataset = load_dataset(dataset_name, split=split)
-    row_data = dataset[index]
+
+    row_data = get_row(index=index, id=id, split=split, dataset_name=dataset_name)
     id = row_data['instance_id']
     write_json('rows', f"{id}", row_data)
     write_markdown('rows', f"{id}", row_data)
-    
+
+
+def get_row(index:int=0, id:str=None, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
+    dataset = load_dataset(dataset_name, split=split)
+
+    if id is not None:
+        for i, row_data in enumerate(dataset):
+            if row_data['instance_id'] == id:
+                index = i
+                break
+        else:
+            print(f"Row with id '{id}' not found in the dataset", file=sys.stderr)
+            raise typer.Exit(code=1)
+
+    return dataset[index]
+
 def diff_file_names(text: str) -> list[str]:
     return [
         line[len("+++ b/"):] 
@@ -93,7 +156,7 @@ def diff_file_names(text: str) -> list[str]:
 
 @get_app.command()
 def oracle(split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
-    """Down load oracle (patched files) for all rows in split"""
+    """Download oracle (patched files) for all rows in split"""
     dataset = load_dataset(dataset_name, split=split)
     result = []
     for row_data in dataset:
@@ -102,27 +165,95 @@ def oracle(split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
         result.append({
             "id": row_data['instance_id'],
             "repo": row_data['repo'],
+            "created_at": row_data['created_at'],
             "base_commit": row_data['base_commit'],
             "patch_files": patch_files,
-            "test_patch_files": test_patch_files 
+            "test_patch_files": test_patch_files,
+            "problem_statement": row_data['problem_statement'],
         })
     write_json('rows', "oracle", result)
 
 
+def get_case(id: str):
+    with open(f'rows/oracle.json') as f:
+        oracle_json = json.load(f)
+
+    for row in oracle_json:
+        if row['id'] == id:
+            return row
+
+
+def calculate_precision_recall(recommended_files: List[str], patch_files: List[str]):
+    true_positives = set(recommended_files) & set(patch_files)
+    precision = len(true_positives) / len(recommended_files) if len(recommended_files) > 0 else 0
+    recall = len(true_positives) / len(patch_files) if len(patch_files) > 0 else 0
+
+    return precision, recall
+
+
+def benchmark_retrieve(retriever: CodeSnippetRetriever, query: str, patch_files: list[str]):
+    result = retriever.retrieve(query)
+    files = [snippet.path for snippet in result]
+    recommended_files = []
+    for file in files:
+        if file not in recommended_files:
+            recommended_files.append(file)
+
+    precision, recall = calculate_precision_recall(recommended_files, patch_files)
+    print(f"\nPrecision: {precision:.2f}")
+    print(f"Recall: {recall:.2f}")
+
+    printed_files = set()
+
+    for i, file_path in enumerate(recommended_files, start=1):
+        if file_path in printed_files:
+            continue
+
+        if file_path in patch_files:
+            print(f" -> {i}: {file_path}")
+            patch_files.remove(file_path)
+        else:
+            print(f"    {i}: {file_path}")
+
+        printed_files.add(file_path)
+
+        if not patch_files:
+            break
+
+    print("\nMissing Patch Files:")
+    for i, file_path in enumerate(patch_files, start=1):
+        print(f"{i}: {file_path}")
+
+
 @run_app.command()
-def retrieve(index:int=0, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
-    dataset = load_dataset(dataset_name, split=split)
-    row_data = dataset[index]
+def benchmark(id:str=None, split: str='dev', dataset_name='princeton-nlp/SWE-bench'):
+    row_data = get_case(id=id)
     repo_name = row_data['repo'].split('/')[-1]
     repo = f'git@github.com:{row_data["repo"]}.git'
     base_commit = row_data['base_commit']
-    path = f'/tmp/{dataset_name}-{split}/{repo_name}/{base_commit}'
+    path = f'/tmp/repos/{repo_name}'
     if not os.path.exists(path):
         os.makedirs(path)
         print(f"Directory '{path}' was created.")
     maybe_clone(repo, path)
     checkout_commit(path, base_commit)
-    pass
+
+    pipeline_setup = ingestion_pipelines[0]
+
+    retriever = LlamaIndexCodeSnippetRetriever.from_pipeline_setup(
+        pipeline_setup=pipeline_setup,
+        path=path,
+        perist_dir=f"/tmp/repos/{repo_name}-storage/{pipeline_setup.name}",
+    )
+
+    patch_files = [f"{path}/{file}" for file in row_data["patch_files"]]
+
+    benchmark_retrieve(
+            retriever=retriever,
+            query=row_data["problem_statement"],
+            patch_files=patch_files
+    )
+
 
 @app.callback()
 def main(
